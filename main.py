@@ -2,9 +2,12 @@ from telegram import Update
 from dotenv import load_dotenv
 from telegram.ext import Application, CommandHandler, ContextTypes, CallbackContext, JobQueue
 import os
+import json
 import requests
+import logging
 
 load_dotenv()
+logging.basicConfig(level=logging.INFO)
 
 # Put your YOUTUBE API KEY here
 YOUTUBE_API_KEY = os.getenv('YOUTUBE_API_KEY')
@@ -13,7 +16,7 @@ YOUTUBE_API_KEY = os.getenv('YOUTUBE_API_KEY')
 CHANNELS = [
     {"channel_id": "UCMwGHR0BTZuLsmjY_NT5Pwg", "name": "Ninomae Ina'nis"},
     {"channel_id": "UC8rcEBzJSleTkf_-agPM20g", "name": "IRyS"},
-    # {"channel_id": "UCl69AEx4MdqMZH7Jtsm7Tig", "name": "Raora Panthera"},
+    {"channel_id": "UCl69AEx4MdqMZH7Jtsm7Tig", "name": "Raora Panthera"},
     {"channel_id": "UC9p_lqQ0FEDz327Vgf5JwqA", "name": "Koseki Bijou"},
     {"channel_id": "UCgmPnx-EEeOrZSg5Tiw7ZRQ", "name": "Hakos Baelz"},
     {"channel_id": "UCL_qhgtOy0dy1Agp8vkySQg", "name": "Mori Calliope"},
@@ -32,7 +35,6 @@ CHANNELS = [
 
 # Paste your Chat ID Telegram Bot here
 CHAT_ID = os.getenv('CHAT_ID')
-last_live_status = {channel['channel_id']: False for channel in CHANNELS}
 
 async def test(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(f'This bot works perfectly. My Lord, {update.effective_user.first_name}')
@@ -57,14 +59,12 @@ def get_live_stream(channel_id):
     return None
 
 async def periodic_check(context: CallbackContext):
-    global last_live_status
     for channel in CHANNELS:
         live_stream = get_live_stream(channel['channel_id'])
-        if live_stream and not last_live_status[channel['channel_id']]:
+        if live_stream:
             await context.bot.send_message(chat_id=CHAT_ID, text=f"{channel['name']} is live NOW!: {live_stream}")
-            last_live_status[channel['channel_id']] = True
         elif not live_stream:
-            last_live_status[channel['channel_id']] = False
+            await context.bot.send_message(chat_id=CHAT_ID, text=f"No livestreams for channel {channel['name']} at the moment.")
 
 def main():
     """
