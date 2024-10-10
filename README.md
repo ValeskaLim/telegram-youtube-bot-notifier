@@ -5,9 +5,9 @@ Built using Youtube Data API V3
 
 ## Installation
 
-1. Install the dependency
+1. Install the dependency in your virtual environment
 ```
-pip install python-telegram-bot python-telegram python-dotenv
+pip install python-telegram-bot python-telegram python-dotenv requests
 ```
 
 2. Replace this with your TELEGRAM_BOT_TOKEN, YOUTUBE_API_KEY, and CHAT_ID
