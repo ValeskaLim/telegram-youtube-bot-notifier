@@ -1,4 +1,4 @@
-# Telegram Youtube Bot 🤖
+# Telegram Youtube Bot Notifier 🤖
 The purpose why i made this bot is to built my first bot using Telegram. And it's also aimed to help me on my job. It will send you a notification whetever the channel is go live or not. The default channel list in this bot is Hololive English :D
 
 Built using Youtube Data API V3
