@@ -60,17 +60,14 @@ CHANNELS = [
     {"channel_id": "UC9p_lqQ0FEDz327Vgf5JwqA", "name": "Koseki Bijou"},
     {"channel_id": "UCgmPnx-EEeOrZSg5Tiw7ZRQ", "name": "Hakos Baelz"},
     {"channel_id": "UCL_qhgtOy0dy1Agp8vkySQg", "name": "Mori Calliope"},
-    # {"channel_id": "UCHsx4Hqa-1ORjQTh9TYDhww", "name": "Takanashi Kiara"},
-    # {"channel_id": "UC_sFNM0z0MWm9A6WlKPuMMg", "name": "Nerissa Ravencroft"},
-    # {"channel_id": "UCgnfPPb9JI3e9A4cXHnWbyg", "name": "Shiori Novella"},
-    {"channel_id": "UC3n5uGu18FoCy23ggWWp8tA", "name": "Nanashi Mumei"},
+    {"channel_id": "UCHsx4Hqa-1ORjQTh9TYDhww", "name": "Takanashi Kiara"},
+    {"channel_id": "UC_sFNM0z0MWm9A6WlKPuMMg", "name": "Nerissa Ravencroft"},
+    {"channel_id": "UCgnfPPb9JI3e9A4cXHnWbyg", "name": "Shiori Novella"},
     {"channel_id": "UCvN5h1ShZtc7nly3pezRayg", "name": "Cecilia Immergreen"},
-    # {"channel_id": "UCDHABijvPBnJm7F-KlNME3w", "name": "Gigi Murin"},
-    {"channel_id": "UCO_aKKYxn4tvrqPjcTzZ6EQ", "name": "Ceres Fauna"},
+    {"channel_id": "UCDHABijvPBnJm7F-KlNME3w", "name": "Gigi Murin"},
     {"channel_id": "UCt9H_RpQzhxzlyBxFqrdHqA", "name": "FUWAMOCO"},
     {"channel_id": "UCmbs8T6MWqUHP1tIQvSgKrg", "name": "Ouro Kronii"},
-    {"channel_id": "UCoSrY_IQQVpmIRZ9Xf-y93g", "name": "Gawr Gura"},
-    # {"channel_id": "UCW5uhrG1eCBYditmhL0Ykjw", "name": "Elizabeth Rose "},
+    {"channel_id": "UCW5uhrG1eCBYditmhL0Ykjw", "name": "Elizabeth Rose "},
 ]
 
 # Paste your Chat ID Telegram Bot here
