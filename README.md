@@ -1,187 +1,102 @@
 # Telegram YouTube Bot Notifier 🤖
 
-Smart, optimized YouTube livestream notifier for Telegram. Monitors VTuber channels and sends instant notifications when they go live.
+Smart, lightweight notifier that pings you on Telegram the moment a monitored
+Hololive VTuber goes live on YouTube.
 
-## ✨ Features
+## ✨ How it works
 
-- **Smart Caching** - Reduces API calls by caching channel states with intelligent TTL
-- **Rate Limiting Protection** - Built-in delays and quota tracking to stay under YouTube API limits
-- **Duplicate Notification Prevention** - Only notifies when channels newly go live (not repeated alerts)
-- **Concurrent Checking** - Checks multiple channels efficiently with connection pooling
-- **Live Stream Detection** - Automatically detects when streams end
-- **Daily Quota Management** - Tracks API usage and stays under 10,000 daily limit
+The bot polls the [Holodex](https://holodex.net) API, which is purpose-built for
+VTuber stream tracking. A **single request returns the live/upcoming state of
+every monitored channel at once**, so the bot can check often (every ~2 minutes
+by default) for near-instant alerts while using almost no quota.
 
-## 🚀 Optimization Improvements
+If a `HOLODEX_API_KEY` isn't configured, it falls back to the YouTube Data API
+(one search per channel, 100 quota units each).
 
-### Before (Inefficient)
-- ❌ Every check called YouTube API for ALL channels
-- ❌ No caching - redundant API calls
-- ❌ No state tracking - couldn't detect new vs. ongoing streams
-- ❌ Wasted quota on channels just checked
+### Key features
 
-### After (Optimized)
-- ✅ Smart caching with 1-hour TTL (5-min for live channels)
-- ✅ State tracking per channel (live/offline status)
-- ✅ Only notifies on NEW live streams
-- ✅ Daily quota tracking with 9,000 call soft limit
-- ✅ Connection pooling with retry logic
-- ✅ Rate limiting delays between checks
+- **One API call per check** for all channels (vs. one expensive call *per channel*)
+- **Fast polling** (~2 min) so alerts arrive promptly, not hours later
+- **De-duplicated alerts** — keyed by video ID, so an ongoing stream is never
+  re-announced, but a brand-new stream always is
+- **No restart spam** — already-live streams are silently synced on startup
+  (toggle with `NOTIFY_ON_STARTUP`)
+- **Resilient** — a failed check keeps the previous state instead of marking
+  everyone offline; automatic retries with backoff; optional YouTube fallback
 
 ## 📦 Installation
 
-1. Clone the repository:
 ```bash
 git clone https://github.com/ValeskaLim/telegram-youtube-bot-notifier.git
 cd telegram-youtube-bot-notifier
-```
 
-2. Create virtual environment and install dependencies:
-```bash
 python -m venv venv
-source venv/bin/activate  # On Windows: venv\Scripts\activate
+source venv/bin/activate        # Windows: venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
-3. Create `.env` file with your credentials:
+Create a `.env` file (see `.env.example`):
+
 ```env
 TELEGRAM_BOT_TOKEN=your_telegram_bot_token
-YOUTUBE_API_KEY=your_youtube_api_key
 CHAT_ID=your_telegram_chat_id
+HOLODEX_API_KEY=your_holodex_api_key
+# YOUTUBE_API_KEY=        # optional fallback
+# CHECK_INTERVAL_SECONDS=120
+# NOTIFY_ON_STARTUP=false
 ```
 
-4. Run the bot:
+Get a free Holodex key: sign in at <https://holodex.net> → Account → create an API key.
+
+Run it:
+
 ```bash
 python main.py
 ```
 
-## 🤖 Telegram Commands
+## 🤖 Telegram commands
 
 | Command | Description |
 |---------|-------------|
-| `/test` | Test bot connectivity and show status |
-| `/status` | Detailed bot statistics and live channels |
-| `/check_livestream [name]` | Manual check (optional: filter by channel name) |
-| `/force_check` | Force fresh check of all channels (bypass cache) |
+| `/test` | Quick health check and status |
+| `/status` | Detailed status, current live channels, daily call count |
+| `/check_livestream [name]` | Run a fresh check now (optional name filter for display) |
+| `/force_check` | Force a fresh check of all channels |
 
-## 📊 Quota Management
+## ⚙️ Configuration
 
-YouTube Data API v3 has a daily quota of 10,000 units. Each search call costs ~100 units.
+Set via environment variables (see `.env.example`):
 
-**Recommended Settings:**
-- **Check Interval:** 3.5 hours (12,600 seconds) - default
-- **Channels:** 10-15 channels
-- **Daily API Calls:** ~100-200 (well under limit)
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `CHECK_INTERVAL_SECONDS` | `120` | Seconds between checks |
+| `HTTP_TIMEOUT_SECONDS` | `15` | Per-request timeout |
+| `NOTIFY_ON_STARTUP` | `false` | Alert for already-live streams on (re)start |
 
-**Quota Calculation:**
-```
-15 channels × 4 checks/day × 100 units = 6,000 units/day
-```
+The monitored channels live in the `CHANNELS` list in `main.py`.
 
-## 🔧 Configuration
+## 📊 Quota notes
 
-Edit these constants in `main.py`:
+- **Holodex:** one cached `/users/live` request per check. At 120s that's ~720
+  calls/day — comfortably within the free tier.
+- **YouTube fallback:** `search.list` costs **100 units** of the 10,000/day quota,
+  i.e. only ~100 calls/day total. The bot tracks units in `/status`; if you rely
+  on YouTube alone, raise `CHECK_INTERVAL_SECONDS` accordingly.
 
-```python
-CHECK_INTERVAL_SECONDS = 12600  # Time between full checks (3.5 hours)
-CHANNEL_CHECK_DELAY = 0.5       # Delay between channel checks (rate limiting)
-CACHE_TTL_SECONDS = 3600        # Cache validity (1 hour)
-```
+> Note: Holodex sits behind Cloudflare and rejects the default Python user-agent,
+> so the bot sends a custom `User-Agent` header. Keep that if you tweak requests.
 
-## 🖥️ VPS Deployment
+## 🖥️ VPS deployment
 
-### Backup Existing Installation
-```bash
-# SSH into your VPS
-ssh user@your-vps-ip
+See [DEPLOYMENT.md](DEPLOYMENT.md). In short: run as a `systemd` service with
+`Restart=always`, keep the `.env` on the server, and tail logs with
+`sudo journalctl -u youtube-notifier -f`.
 
-# Backup current installation
-cd ~
-tar -czf youtube-notifier-backup-$(date +%Y%m%d).tar.gz youtube-notifier/
-```
+## 📝 Monitored channels
 
-### Deploy New Version
-```bash
-# Stop existing bot (if running as service)
-sudo systemctl stop youtube-notifier
-
-# Or kill running process
-pkill -f "python.*main.py"
-
-# Update code
-cd ~/youtube-notifier
-git pull origin main
-
-# Install/update dependencies
-pip install -r requirements.txt
-
-# Restart bot
-sudo systemctl start youtube-notifier
-# Or run manually: python main.py
-```
-
-### Systemd Service (Recommended)
-Create `/etc/systemd/system/youtube-notifier.service`:
-```ini
-[Unit]
-Description=YouTube Telegram Notifier Bot
-After=network.target
-
-[Service]
-Type=simple
-User=your-user
-WorkingDirectory=/home/your-user/youtube-notifier
-Environment=PATH=/home/your-user/youtube-notifier/venv/bin
-ExecStart=/home/your-user/youtube-notifier/venv/bin/python main.py
-Restart=always
-
-[Install]
-WantedBy=multi-user.target
-```
-
-```bash
-sudo systemctl enable youtube-notifier
-sudo systemctl daemon-reload
-```
-
-## 📝 Monitored Channels
-
-Default: Hololive English VTubers
-- Ninomae Ina'nis
-- IRyS
-- Raora Panthera
-- Koseki Bijou
-- Hakos Baelz
-- Mori Calliope
-- Nanashi Mumei
-- Cecilia Immergreen
-- Ceres Fauna
-- FUWAMOCO
-- Ouro Kronii
-- Gawr Gura
-
-Edit the `CHANNELS` list in `main.py` to customize.
-
-## 🐛 Troubleshooting
-
-**Bot not sending notifications:**
-- Check `CHAT_ID` is correct (use @userinfobot to get your ID)
-- Verify bot has permission to send messages to the chat
-
-**API quota errors:**
-- Reduce check interval or number of channels
-- Check `api_calls_today` with `/status` command
-
-**Bot crashes on startup:**
-- Verify `.env` file exists with all required variables
-- Check Python version (3.10+ recommended)
+Hololive English (Myth, Promise, Advent, Justice). Edit the `CHANNELS` list in
+`main.py` to customize.
 
 ## 📄 License
 
-MIT License - see LICENSE file
-
-## 🙏 Credits
-
-Built with:
-- [python-telegram-bot](https://github.com/python-telegram-bot/python-telegram-bot)
-- YouTube Data API v3
-- ❤️ for VTubers
+MIT — see [LICENSE](LICENSE).

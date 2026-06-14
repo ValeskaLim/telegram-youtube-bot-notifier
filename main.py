@@ -1,58 +1,79 @@
-from telegram import Update
-from dotenv import load_dotenv
-from telegram.ext import Application, CommandHandler, ContextTypes, CallbackContext, JobQueue
+"""Telegram notifier for VTuber livestreams.
+
+Detects when monitored Hololive channels go live and pushes a Telegram message.
+
+Primary data source is the Holodex API: a single request returns the live/upcoming
+state for every monitored channel at once, so the bot can poll frequently (default
+every 2 minutes) while staying well within rate limits. If no Holodex key is set,
+it falls back to the YouTube Data API (one search per channel, 100 quota units each).
+"""
 import os
+import html
+import time
 import asyncio
+import logging
+from dataclasses import dataclass, field
+from typing import Dict, Optional
+
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
-import logging
-import time
-from typing import Dict, Optional, Set
-from dataclasses import dataclass, field
+from dotenv import load_dotenv
+from telegram import Update
+from telegram.ext import Application, CommandHandler, ContextTypes, CallbackContext
 
 load_dotenv()
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
-# Put your YOUTUBE API KEY here
-YOUTUBE_API_KEY = os.getenv('YOUTUBE_API_KEY')
 
+# --------------------------------------------------------------------------- #
 # Configuration
-CHECK_INTERVAL_SECONDS = 12600  # 3.5 hours between full checks
-CHANNEL_CHECK_DELAY = 0.5  # Delay between individual channel checks to avoid rate limiting
-CACHE_TTL_SECONDS = 3600  # Cache results for 1 hour
+# --------------------------------------------------------------------------- #
+def _int_env(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        logger.warning("Invalid %s, using default %s", name, default)
+        return default
 
-@dataclass
-class ChannelState:
-    """Track state for each channel"""
-    is_live: bool = False
-    last_checked: float = 0.0
-    last_live_notification: float = 0.0
-    video_id: Optional[str] = None
-    consecutive_failures: int = 0
 
-@dataclass
-class AppState:
-    """Global application state"""
-    channel_states: Dict[str, ChannelState] = field(default_factory=dict)
-    last_full_check: float = 0.0
-    api_calls_today: int = 0
-    last_reset: float = field(default_factory=lambda: time.time())
+def _bool_env(name: str, default: bool) -> bool:
+    return os.getenv(name, str(default)).strip().lower() in {"1", "true", "yes", "on"}
 
-# Shared session with connection pooling and retries
+
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+CHAT_ID = os.getenv("CHAT_ID")
+HOLODEX_API_KEY = os.getenv("HOLODEX_API_KEY")          # primary source (recommended)
+YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY")          # optional fallback
+
+# How often to poll. Holodex is cheap so 120s gives near-instant alerts.
+CHECK_INTERVAL_SECONDS = _int_env("CHECK_INTERVAL_SECONDS", 120)
+HTTP_TIMEOUT = _int_env("HTTP_TIMEOUT_SECONDS", 15)
+# If true, also alert for streams already live when the bot (re)starts.
+# Default false avoids a burst of alerts every time the service restarts.
+NOTIFY_ON_STARTUP = _bool_env("NOTIFY_ON_STARTUP", False)
+
+HOLODEX_LIVE_URL = "https://holodex.net/api/v2/users/live"
+HOLODEX_MAX_CHANNELS = 50  # API caps channels per request
+YOUTUBE_SEARCH_URL = "https://www.googleapis.com/youtube/v3/search"
+YOUTUBE_SEARCH_COST = 100  # quota units per search.list call
+USER_AGENT = "telegram-youtube-bot/2.0 (+https://github.com/ValeskaLim)"
+
+# Cloudflare in front of Holodex rejects the default python user-agent, so set one.
 def _create_session() -> requests.Session:
     session = requests.Session()
-    retry = Retry(total=3, backoff_factor=0.5, status_forcelist=[429, 500, 502, 503])
-    adapter = HTTPAdapter(max_retries=retry, pool_connections=10, pool_maxsize=10, pool_block=False)
+    retry = Retry(total=3, backoff_factor=0.5, status_forcelist=[429, 500, 502, 503, 504])
+    adapter = HTTPAdapter(max_retries=retry, pool_connections=10, pool_maxsize=10)
     session.mount("https://", adapter)
     session.mount("http://", adapter)
+    session.headers.update({"User-Agent": USER_AGENT})
     return session
 
-HTTP_SESSION = _create_session()
-APP_STATE = AppState()
 
-# List of channels
+HTTP_SESSION = _create_session()
+
+# Channels to monitor (Hololive English).
 CHANNELS = [
     {"channel_id": "UCMwGHR0BTZuLsmjY_NT5Pwg", "name": "Ninomae Ina'nis"},
     {"channel_id": "UC8rcEBzJSleTkf_-agPM20g", "name": "IRyS"},
@@ -67,282 +88,304 @@ CHANNELS = [
     {"channel_id": "UCDHABijvPBnJm7F-KlNME3w", "name": "Gigi Murin"},
     {"channel_id": "UCt9H_RpQzhxzlyBxFqrdHqA", "name": "FUWAMOCO"},
     {"channel_id": "UCmbs8T6MWqUHP1tIQvSgKrg", "name": "Ouro Kronii"},
-    {"channel_id": "UCW5uhrG1eCBYditmhL0Ykjw", "name": "Elizabeth Rose "},
+    {"channel_id": "UCW5uhrG1eCBYditmhL0Ykjw", "name": "Elizabeth Rose Bloodflame"},
 ]
-
-# Paste your Chat ID Telegram Bot here
-CHAT_ID = os.getenv('CHAT_ID')
-
-
-def reset_daily_quota():
-    """Reset API call counter if a new day has started"""
-    current_time = time.time()
-    if current_time - APP_STATE.last_reset > 86400:  # 24 hours
-        APP_STATE.api_calls_today = 0
-        APP_STATE.last_reset = current_time
-        logger.info("Daily API quota reset")
+CHANNEL_NAMES = {c["channel_id"]: c["name"] for c in CHANNELS}
+CHANNEL_IDS = [c["channel_id"] for c in CHANNELS]
 
 
-def should_check_channel(channel_id: str) -> bool:
-    """Determine if a channel should be checked based on cache TTL"""
-    if channel_id not in APP_STATE.channel_states:
-        APP_STATE.channel_states[channel_id] = ChannelState()
-    
-    state = APP_STATE.channel_states[channel_id]
-    time_since_check = time.time() - state.last_checked
-    
-    # Always check if cache expired or channel was live (need to detect when it ends)
-    if time_since_check > CACHE_TTL_SECONDS:
-        return True
-    
-    # Check recently live channels more frequently to detect stream end
-    if state.is_live and time_since_check > 300:  # Check live channels every 5 min
-        return True
-    
-    return False
+# --------------------------------------------------------------------------- #
+# State
+# --------------------------------------------------------------------------- #
+@dataclass
+class ChannelState:
+    is_live: bool = False
+    video_id: Optional[str] = None
+    title: Optional[str] = None
+    notified_video_id: Optional[str] = None  # last video we already alerted for
+    last_live_at: float = 0.0
 
 
-def get_live_stream(channel_id: str, channel_name: str, session: requests.Session | None = None) -> tuple[Optional[str], bool]:
+@dataclass
+class AppState:
+    channel_states: Dict[str, ChannelState] = field(
+        default_factory=lambda: {cid: ChannelState() for cid in CHANNEL_IDS}
+    )
+    last_check: float = 0.0
+    last_check_ok: bool = False
+    consecutive_failures: int = 0
+    first_sync_done: bool = False
+    holodex_calls_today: int = 0
+    youtube_units_today: int = 0
+    last_reset: float = field(default_factory=time.time)
+
+
+APP_STATE = AppState()
+
+
+def reset_daily_counters() -> None:
+    if time.time() - APP_STATE.last_reset > 86400:
+        APP_STATE.holodex_calls_today = 0
+        APP_STATE.youtube_units_today = 0
+        APP_STATE.last_reset = time.time()
+        logger.info("Daily counters reset")
+
+
+# --------------------------------------------------------------------------- #
+# Data sources (sync; run via asyncio.to_thread)
+# --------------------------------------------------------------------------- #
+def _fetch_live_holodex() -> Dict[str, dict]:
+    """Return {channel_id: {'video_id', 'title'}} for channels that are LIVE.
+
+    Raises requests.RequestException on failure so the caller can react.
     """
-    Check if a channel is live. Returns (video_url, success).
-    Uses shared session for connection pooling.
+    live: Dict[str, dict] = {}
+    for i in range(0, len(CHANNEL_IDS), HOLODEX_MAX_CHANNELS):
+        chunk = CHANNEL_IDS[i:i + HOLODEX_MAX_CHANNELS]
+        resp = HTTP_SESSION.get(
+            HOLODEX_LIVE_URL,
+            params={"channels": ",".join(chunk)},
+            headers={"X-APIKEY": HOLODEX_API_KEY},
+            timeout=HTTP_TIMEOUT,
+        )
+        APP_STATE.holodex_calls_today += 1
+        resp.raise_for_status()
+        for video in resp.json() or []:
+            if video.get("status") != "live":
+                continue
+            channel_id = (video.get("channel") or {}).get("id") or video.get("channel_id")
+            if channel_id:
+                live[channel_id] = {"video_id": video.get("id"), "title": video.get("title")}
+    return live
+
+
+def _fetch_live_youtube() -> Dict[str, dict]:
+    """Fallback: one search per channel via the YouTube Data API (100 units each).
+
+    Skips channels that error so a single failure doesn't sink the whole cycle.
+    Raises only if *every* channel request failed.
     """
-    session = session or HTTP_SESSION
-    url = f"https://www.googleapis.com/youtube/v3/search?part=snippet&channelId={channel_id}&eventType=live&type=video&maxResults=1&key={YOUTUBE_API_KEY}"
-    
+    live: Dict[str, dict] = {}
+    any_ok = False
+    last_error: Optional[Exception] = None
+    for cid in CHANNEL_IDS:
+        try:
+            resp = HTTP_SESSION.get(
+                YOUTUBE_SEARCH_URL,
+                params={
+                    "part": "snippet", "channelId": cid, "eventType": "live",
+                    "type": "video", "maxResults": 1, "key": YOUTUBE_API_KEY,
+                },
+                timeout=HTTP_TIMEOUT,
+            )
+            APP_STATE.youtube_units_today += YOUTUBE_SEARCH_COST
+            resp.raise_for_status()
+            any_ok = True
+            items = resp.json().get("items", [])
+            if items:
+                live[cid] = {
+                    "video_id": items[0]["id"].get("videoId"),
+                    "title": items[0].get("snippet", {}).get("title"),
+                }
+        except requests.RequestException as e:
+            last_error = e
+            logger.warning("YouTube check failed for %s: %s", CHANNEL_NAMES.get(cid, cid), e)
+    if not any_ok and last_error:
+        raise last_error
+    return live
+
+
+def collect_live_streams() -> Optional[Dict[str, dict]]:
+    """Detect currently-live channels. Returns the live map, or None if detection
+    failed entirely (so callers can preserve prior state instead of marking all offline).
+    """
+    if HOLODEX_API_KEY:
+        try:
+            return _fetch_live_holodex()
+        except requests.RequestException as e:
+            logger.warning("Holodex check failed: %s", e)
+            if not YOUTUBE_API_KEY:
+                return None
+            logger.info("Falling back to YouTube API for this cycle")
+    if YOUTUBE_API_KEY:
+        try:
+            return _fetch_live_youtube()
+        except requests.RequestException as e:
+            logger.warning("YouTube fallback failed: %s", e)
+    return None
+
+
+# --------------------------------------------------------------------------- #
+# Notification + state diff
+# --------------------------------------------------------------------------- #
+async def _send_live_alert(context: CallbackContext, name: str, state: ChannelState) -> None:
+    url = f"https://www.youtube.com/watch?v={state.video_id}"
+    text = f"🔴 <b>{html.escape(name)}</b> is LIVE NOW!\n"
+    if state.title:
+        text += f"<i>{html.escape(state.title)}</i>\n"
+    text += url
     try:
-        response = session.get(url, timeout=10)
-        APP_STATE.api_calls_today += 1
-        
-        if response.status_code == 429:
-            logger.warning(f"Rate limited for {channel_name}. Backing off.")
-            return (None, False)
-        
-        response.raise_for_status()
-        data = response.json()
-    except requests.exceptions.Timeout:
-        logger.warning(f"Timeout checking {channel_name}")
-        return (None, False)
-    except requests.exceptions.RequestException as e:
-        logger.warning(f"YouTube API request failed for {channel_name}: {e}")
-        return (None, False)
-    except ValueError as e:
-        logger.warning(f"Invalid JSON response for {channel_name}: {e}")
-        return (None, False)
-
-    if "items" in data and len(data["items"]) > 0:
-        video_id = data["items"][0]["id"]["videoId"]
-        return (f"https://www.youtube.com/watch?v={video_id}", True)
-    
-    return (None, True)
+        await context.bot.send_message(chat_id=CHAT_ID, text=text, parse_mode="HTML")
+        logger.info("🔴 Notified: %s (%s)", name, url)
+    except Exception as e:  # noqa: BLE001 - never let a send failure crash the cycle
+        logger.error("Failed to send notification for %s: %s", name, e)
 
 
-async def check_single_channel(channel: dict, context: CallbackContext) -> None:
-    """Check a single channel and send notification if newly live"""
-    channel_id = channel["channel_id"]
-    channel_name = channel["name"]
-    
-    if not should_check_channel(channel_id):
-        logger.debug(f"Skipping {channel_name} (cached)")
-        return
-    
-    if APP_STATE.api_calls_today >= 9000:  # Stay under 10k daily limit with buffer
-        logger.warning("Approaching daily API quota limit. Skipping remaining checks.")
-        return
-    
-    logger.info(f"Checking {channel_name}...")
-    
-    video_url, success = await asyncio.to_thread(get_live_stream, channel_id, channel_name, HTTP_SESSION)
-    
-    # Update state
-    if channel_id not in APP_STATE.channel_states:
-        APP_STATE.channel_states[channel_id] = ChannelState()
-    
-    state = APP_STATE.channel_states[channel_id]
-    state.last_checked = time.time()
-    
-    if not success:
-        state.consecutive_failures += 1
-        if state.consecutive_failures >= 3:
-            logger.error(f"Multiple failures for {channel_name}. Backing off.")
-        return
-    
-    state.consecutive_failures = 0
-    was_live = state.is_live
-    
-    if video_url:
-        state.is_live = True
-        state.video_id = video_url.split('v=')[1] if 'v=' in video_url else None
-        
-        # Only notify if newly live (not already notified)
-        if not was_live:
-            logger.info(f"🔴 {channel_name} is NOW LIVE!")
-            try:
-                await context.bot.send_message(
-                    chat_id=CHAT_ID,
-                    text=f"🔴 <b>{channel_name}</b> is LIVE NOW!\n{video_url}",
-                    parse_mode='HTML'
-                )
-                state.last_live_notification = time.time()
-            except Exception as e:
-                logger.error(f"Failed to send notification for {channel_name}: {e}")
+async def apply_live_state(live: Dict[str, dict], context: CallbackContext, notify: bool = True) -> None:
+    """Update channel states from the live map and alert on newly-live channels.
+
+    De-dupes by video id: an ongoing stream is never re-announced, while a new
+    stream (new video id) always is.
+    """
+    now = time.time()
+    for cid in CHANNEL_IDS:
+        state = APP_STATE.channel_states[cid]
+        info = live.get(cid)
+        if info and info.get("video_id"):
+            state.is_live = True
+            state.video_id = info["video_id"]
+            state.title = info.get("title")
+            state.last_live_at = now
+            if state.video_id != state.notified_video_id:
+                if notify:
+                    await _send_live_alert(context, CHANNEL_NAMES[cid], state)
+                state.notified_video_id = state.video_id  # mark handled (also seeds silent sync)
         else:
-            logger.debug(f"{channel_name} still live (already notified)")
-    else:
-        if was_live:
-            logger.info(f"⚫ {channel_name} stream ended")
-        state.is_live = False
-        state.video_id = None
-    
-    # Small delay to avoid rate limiting
-    await asyncio.sleep(CHANNEL_CHECK_DELAY)
+            if state.is_live:
+                logger.info("⚫ %s stream ended", CHANNEL_NAMES[cid])
+            state.is_live = False
+            state.video_id = None
+            state.title = None
+
+
+# --------------------------------------------------------------------------- #
+# Jobs & commands
+# --------------------------------------------------------------------------- #
+async def run_check(context: CallbackContext) -> Optional[int]:
+    """Run one detection cycle. Returns live channel count, or None on failure."""
+    reset_daily_counters()
+    live = await asyncio.to_thread(collect_live_streams)
+    APP_STATE.last_check = time.time()
+    if live is None:
+        APP_STATE.last_check_ok = False
+        APP_STATE.consecutive_failures += 1
+        logger.warning("Live check failed (streak %d); keeping previous state",
+                       APP_STATE.consecutive_failures)
+        return None
+    APP_STATE.last_check_ok = True
+    APP_STATE.consecutive_failures = 0
+    notify = APP_STATE.first_sync_done or NOTIFY_ON_STARTUP
+    await apply_live_state(live, context, notify=notify)
+    APP_STATE.first_sync_done = True
+    return sum(1 for s in APP_STATE.channel_states.values() if s.is_live)
 
 
 async def periodic_check(context: CallbackContext) -> None:
-    """Periodic job to check all channels with smart caching"""
-    reset_daily_quota()
-    
-    logger.info(f"Starting periodic check. API calls today: {APP_STATE.api_calls_today}")
-    APP_STATE.last_full_check = time.time()
-    
-    # Check channels concurrently but with rate limiting
-    tasks = [check_single_channel(channel, context) for channel in CHANNELS]
-    await asyncio.gather(*tasks, return_exceptions=True)
-    
-    # Log summary
-    live_count = sum(1 for state in APP_STATE.channel_states.values() if state.is_live)
-    logger.info(f"Check complete. {live_count}/{len(CHANNELS)} channels currently live. API calls: {APP_STATE.api_calls_today}")
+    live_count = await run_check(context)
+    if live_count is not None:
+        logger.info("Check complete. %d/%d live. Holodex calls today: %d",
+                    live_count, len(CHANNELS), APP_STATE.holodex_calls_today)
+
+
+def _source_label() -> str:
+    if HOLODEX_API_KEY:
+        return "Holodex"
+    if YOUTUBE_API_KEY:
+        return "YouTube (fallback)"
+    return "none"
 
 
 async def test(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Test command to verify bot is working"""
-    live_count = sum(1 for state in APP_STATE.channel_states.values() if state.is_live)
+    live_count = sum(1 for s in APP_STATE.channel_states.values() if s.is_live)
     await update.message.reply_text(
-        f"✅ Bot is working perfectly, my Lord {update.effective_user.first_name}!\n\n"
+        f"✅ Bot is working, {update.effective_user.first_name}!\n\n"
         f"📊 Status:\n"
+        f"• Source: {_source_label()}\n"
         f"• Channels monitored: {len(CHANNELS)}\n"
         f"• Currently live: {live_count}\n"
-        f"• API calls today: {APP_STATE.api_calls_today}"
+        f"• Poll interval: {CHECK_INTERVAL_SECONDS}s"
     )
-
-
-async def check_livestream(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Manual check command with optional channel filter"""
-    name_filter = " ".join(context.args).strip().lower() if context.args else None
-    channels = [c for c in CHANNELS if not name_filter or name_filter in c["name"].lower()]
-
-    if not channels:
-        await update.message.reply_text(f"No channels found matching '{name_filter}'.")
-        return
-
-    await update.message.reply_text(f"Checking {len(channels)} channel(s)...")
-    
-    # Force refresh by clearing cache for these channels
-    for channel in channels:
-        if channel["channel_id"] in APP_STATE.channel_states:
-            APP_STATE.channel_states[channel["channel_id"]].last_checked = 0
-    
-    # Check immediately
-    for channel in channels:
-        await check_single_channel(channel, context)
-    
-    # Report results
-    results = []
-    for channel in channels:
-        state = APP_STATE.channel_states.get(channel["channel_id"])
-        if state and state.is_live and state.video_id:
-            results.append(f"🔴 {channel['name']}: https://www.youtube.com/watch?v={state.video_id}")
-    
-    if results:
-        await update.message.reply_text("\n".join(results))
-    else:
-        await update.message.reply_text("No live streams found.")
 
 
 async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Show detailed bot status and statistics"""
-    reset_daily_quota()
-    
-    live_channels = []
-    offline_channels = []
-    
-    for channel in CHANNELS:
-        state = APP_STATE.channel_states.get(channel["channel_id"])
-        if state and state.is_live:
-            live_channels.append(channel["name"])
-        else:
-            offline_channels.append(channel["name"])
-    
-    status_text = (
+    reset_daily_counters()
+    live = [(c["name"], APP_STATE.channel_states[c["channel_id"]])
+            for c in CHANNELS if APP_STATE.channel_states[c["channel_id"]].is_live]
+    last = (time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(APP_STATE.last_check))
+            if APP_STATE.last_check else "Never")
+    text = (
         f"📊 <b>Bot Status</b>\n\n"
-        f"🔴 Live: {len(live_channels)}\n"
-        f"⚪ Offline: {len(offline_channels)}\n"
-        f"📈 API calls today: {APP_STATE.api_calls_today}/10000\n"
-        f"⏱️ Last full check: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(APP_STATE.last_full_check)) if APP_STATE.last_full_check > 0 else 'Never'}\n\n"
+        f"🛰️ Source: {_source_label()}\n"
+        f"🔴 Live: {len(live)} / {len(CHANNELS)}\n"
+        f"⏱️ Last check: {last} ({'ok' if APP_STATE.last_check_ok else 'FAILED'})\n"
+        f"🔁 Holodex calls today: {APP_STATE.holodex_calls_today}\n"
     )
-    
-    if live_channels:
-        status_text += "<b>Currently Live:</b>\n" + "\n".join(f"• {name}" for name in live_channels[:10])
-        if len(live_channels) > 10:
-            status_text += f"\n... and {len(live_channels) - 10} more"
-    
-    await update.message.reply_text(status_text, parse_mode='HTML')
+    if APP_STATE.youtube_units_today:
+        text += f"📉 YouTube units today: {APP_STATE.youtube_units_today}/10000\n"
+    if live:
+        text += "\n<b>Currently Live:</b>\n" + "\n".join(
+            f"• {html.escape(n)}: https://youtu.be/{s.video_id}" for n, s in live[:15]
+        )
+    await update.message.reply_text(text, parse_mode="HTML")
+
+
+async def check_livestream(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    name_filter = " ".join(context.args).strip().lower() if context.args else None
+    channels = [c for c in CHANNELS if not name_filter or name_filter in c["name"].lower()]
+    if not channels:
+        await update.message.reply_text(f"No channels found matching '{name_filter}'.")
+        return
+    await update.message.reply_text(f"🔄 Checking {len(channels)} channel(s)...")
+    # One call refreshes every channel regardless of the filter; filter is display-only.
+    if await run_check(context) is None:
+        await update.message.reply_text("⚠️ Live check failed (source unavailable). Try again shortly.")
+        return
+    results = [
+        f"🔴 {c['name']}: https://youtu.be/{APP_STATE.channel_states[c['channel_id']].video_id}"
+        for c in channels if APP_STATE.channel_states[c["channel_id"]].is_live
+    ]
+    await update.message.reply_text("\n".join(results) if results else "No live streams found.")
 
 
 async def force_check(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Force immediate check of all channels (bypass cache)"""
     await update.message.reply_text("🔄 Forcing fresh check of all channels...")
-    
-    # Clear all caches
-    for channel_id in APP_STATE.channel_states:
-        APP_STATE.channel_states[channel_id].last_checked = 0
-    
-    # Run check
-    APP_STATE.last_full_check = time.time()
-    tasks = [check_single_channel(channel, context) for channel in CHANNELS]
-    await asyncio.gather(*tasks, return_exceptions=True)
-    
-    live_count = sum(1 for state in APP_STATE.channel_states.values() if state.is_live)
+    live_count = await run_check(context)
+    if live_count is None:
+        await update.message.reply_text("⚠️ Check failed (source unavailable). Try again shortly.")
+        return
     await update.message.reply_text(f"✅ Check complete! {live_count}/{len(CHANNELS)} channels are live.")
 
 
-def main():
-    """Main entry point"""
-    token = os.getenv('TELEGRAM_BOT_TOKEN')
-    
-    if not token:
+# --------------------------------------------------------------------------- #
+# Entry point
+# --------------------------------------------------------------------------- #
+def main() -> None:
+    if not TELEGRAM_BOT_TOKEN:
         logger.error("TELEGRAM_BOT_TOKEN not found in environment!")
         return
-    
-    if not YOUTUBE_API_KEY:
-        logger.error("YOUTUBE_API_KEY not found in environment!")
-        return
-    
     if not CHAT_ID:
         logger.error("CHAT_ID not found in environment!")
         return
-    
-    app = Application.builder().token(token).concurrent_updates(True).build()
-    
-    # Command handlers
+    if not HOLODEX_API_KEY and not YOUTUBE_API_KEY:
+        logger.error("Set HOLODEX_API_KEY (recommended) or YOUTUBE_API_KEY in environment!")
+        return
+    if not HOLODEX_API_KEY:
+        logger.warning("HOLODEX_API_KEY not set - using YouTube fallback "
+                       "(%d units per channel per check).", YOUTUBE_SEARCH_COST)
+
+    app = Application.builder().token(TELEGRAM_BOT_TOKEN).concurrent_updates(True).build()
     app.add_handler(CommandHandler("test", test))
-    app.add_handler(CommandHandler("check_livestream", check_livestream))
     app.add_handler(CommandHandler("status", status_command))
+    app.add_handler(CommandHandler("check_livestream", check_livestream))
     app.add_handler(CommandHandler("force_check", force_check))
-    
-    # Job queue
-    job_queue = app.job_queue
-    
-    # Schedule periodic checks
-    job_queue.run_repeating(periodic_check, interval=CHECK_INTERVAL_SECONDS, first=10)
-    
-    logger.info(f"Telegram bot started! Monitoring {len(CHANNELS)} channels")
-    logger.info(f"Check interval: {CHECK_INTERVAL_SECONDS/3600:.1f} hours")
-    logger.info(f"Cache TTL: {CACHE_TTL_SECONDS/60:.0f} minutes")
-    
+
+    app.job_queue.run_repeating(periodic_check, interval=CHECK_INTERVAL_SECONDS, first=5)
+
+    logger.info("Bot started. Monitoring %d channels every %ds via %s",
+                len(CHANNELS), CHECK_INTERVAL_SECONDS, _source_label())
     print("Telegram bot started!", flush=True)
     app.run_polling()
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
